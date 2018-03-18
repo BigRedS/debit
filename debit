@@ -1,0 +1,369 @@
+#! /usr/bin/perl
+
+use strict;
+use YAML qw/LoadFile DumpFile/;
+use LWP::Simple;
+use Data::Dumper;
+use File::Temp qw/tempdir/;
+use Getopt::Long;
+use File::Path qw/make_path/;
+use Cwd;
+
+my $f_config = './debit.cf';
+my $single_package = undef;
+my $skip_version_check = undef;
+my $quiet = undef;
+my $help = undef;
+my $logfile = './debit.log';
+my $list_packages = undef;
+my $preserve_temp_dir = undef;
+
+GetOptions(
+	'config|c=s' => \$f_config,
+	'package=s' => \$single_package,
+	'skip-version-check' => \$skip_version_check,
+	'list-packages' => \$list_packages,
+	'logfile' => \$logfile,
+	'quiet|q' => \$quiet,
+	'help|h' => \$help,
+	'preserve-temp-dir' => \$preserve_temp_dir,
+
+) or die("Error parsing command line options");
+
+usage() if $help;
+abort("Config file '$f_config' does not exist; try with --help for help") unless -f $f_config;
+my $config = LoadFile($f_config);
+
+if($list_packages){
+	foreach my $package_name (sort(keys(%{$config->{packages}}))){
+		print $package_name.' ('.scalar(keys(%{$config->{packages}->{$package_name}->{files}})). " files)\n";
+	}
+	exit;
+}
+
+$config->{logfile} = $logfile if $logfile;
+my $log_fh = undef;
+open($log_fh, '>>', $config->{logfile}) or abort("Failed to open logfile '$config->{log_file}' : $!") if $config->{log_file};
+
+unless(-d $config->{cache_dir}){
+	make_path($config->{cache_dir});
+	abort("Failed to create cache dir '".$config->{cache_dir}.")") unless -d $config->{cache_dir};
+	info("Created cache dir '$config->{cache_dir}'");
+}
+
+#y @dir_maps = @{$config->{dir_map}};
+#my $dir_maps_string = '--add-dir ' . join(' --add-dir ', @{$config->{dir_map}});
+#info("Dir maps options: $dir_maps_string") unless $list_packages;
+
+
+my @failures;
+foreach my $package_name (sort(keys(%{$config->{packages}}))){
+	next if $single_package and ! ($package_name eq $single_package);
+	my $temp_dh = File::Temp->newdir('/tmp/debit-XXXXXXXXXXXX');
+	if($ENV{DEBUG} > 0 or $preserve_temp_dir){
+		$temp_dh->unlink_on_destroy(0);
+	}
+	my $temp_dir = $temp_dh.'/';
+	info("Processing package $package_name in tempdir $temp_dir ");
+	quietly("Package '$package_name'...");
+
+	my $package = $config->{packages}->{$package_name};
+
+	unless($package->{'meta'}){
+		error(" Package '$package_name' has no 'meta' section. Skipping");
+		push(@failures, $package_name);
+		next;
+	}
+
+	unless($package->{'meta'}->{'description'}){
+		error(" Package '$package_name' has no 'description' meta field. Skipping");
+		push(@failures, $package_name);
+		next;
+	}
+
+	unless($package->{'meta'}->{'requires'}){
+		error(" Package '$package_name' has no 'requires' meta field. Skipping");
+		push(@failures, $package_name);
+		next;
+	}
+
+	unless($package->{'get_version'}){
+		error(" Package '$package_name' has no 'get_version' field. Skipping");
+		push(@failures, $package_name);
+		next;
+	}
+
+	my $meta_file = $temp_dir.'meta.yaml';
+	debug(" Meta file: $meta_file");
+
+	$package->{meta}->{package} = $package_name;
+	foreach my $key (sort(keys(%{$config->{defaults}}))){
+		debug("  Setting meta '$key' from defaults to '$config->{defaults}->{$key}'");
+		$package->{meta}->{$key} = $config->{defaults}->{$key};
+	}
+
+	YAML::DumpFile($meta_file, $package->{meta});
+
+	my %dir_maps;
+	info(" Adding files to package");
+	my $file_errors = 0;
+	foreach my $file (sort(keys(%{$package->{files}}))){
+		my $dirname = $package->{files}->{$file}->{dir};
+		
+		my $mapname = $dirname;
+		$mapname =~ s#^/##g;
+		$dir_maps{$mapname} = $dirname;
+
+		my $filename = $package->{files}->{$file}->{name};
+		my $dest_file = $temp_dir.$dirname.'/'.$filename;
+		$dest_file =~ s#//#/#g;
+
+		info("  '$filename' in '$dirname' coming from '$file'");
+		debug('  Destfile: '.$temp_dir.$dirname);
+
+		make_path($temp_dir.$dirname);
+		error("Failed to create directory '$temp_dir$dirname'") unless -d $temp_dir.$dirname;
+		getstore($file, $dest_file) or error("   Failed to download") and $file_errors++ and next;
+	
+# TODO: think about how to deal with default modes; for now assume everything wants 765
+#		my $mode = $package->{files}->{$file}->{mode} || "0765";
+#		$mode = '0'.$mode if $mode =~ m/^\d{3}$/;
+#		error("Mode '$mode' is invalid") and $file_errors++ and next unless $mode =~ m/^[0-7]{4}$/;
+
+		chmod(0765, $dest_file);
+	}
+	if($file_errors > 0){
+		error("$file_errors errors encountered processing files. Skipping package.");
+		push(@failures, $package_name);
+		next;
+	}
+	info(" Files done");
+
+	debug("  cd to temp dir '$temp_dir'");
+	info(" Getting version with `$package->{get_version}`");
+
+	my $old_dir = getcwd();
+	chdir($temp_dir);
+	my $version = get_version($package->{get_version});
+	chdir($old_dir);
+
+	my $changes_file = $temp_dir.'changes';
+	debug("  Changes file: $changes_file");
+	info("  Version: $version");
+	unless($version =~ m/\d/){
+		error("Cannot build package without version number. Skipping");
+		push(@failures, $package_name);
+		next;
+	}
+	write_changes($changes_file, $version);
+
+
+	my $version_cache_file = $config->{cache_dir}.'/'.$package_name.'.lastversion';
+	$version_cache_file =~ s#//#/#g;
+	if($skip_version_check){
+		info("Skipping version check");
+	}else{
+		info("  Checking if version '$version' is newer than last-build");
+		info("  Version cache file: $version_cache_file");
+		if(my $last_version = check_version_cache($version_cache_file, $version)){
+			info("  Last version '$last_version' already up-to-date; not building package");
+			next;
+		}
+	}
+
+	info(" Package ready! Building");
+
+	my @debosh_cmd = ($config->{debosh}, $config->{debosh_args}, '--debdir', $config->{package_dir});
+	foreach my $mapname (sort(keys(%dir_maps))){
+		push(@debosh_cmd, "--add-dir $mapname:$dir_maps{$mapname}");
+	}
+	my $debosh = join(' ', @debosh_cmd);
+
+
+	$debosh.=' 2>&1';
+	info("Debosh: $debosh");
+
+	my $old_dir = getcwd();
+	chdir($temp_dir);
+	if(run($debosh)){
+		chdir($old_dir);
+		quietly("OK\n");
+		info("Writing version cache ($version in $version_cache_file)");
+		info("Done!");
+		write_version_cache($version_cache_file, $version);
+	}else{
+		chdir($old_dir);
+		error("Failed!");
+		quietly("Failed\n");
+	}
+}
+sub write_version_cache{
+	my $file = shift;
+	my $version = shift;
+	open(my $fh, '>', $file) or error("Failed to write version cache file '$file': $!") and return;
+	print $fh $version;
+	close($fh);
+}
+
+# Given a file with the version from the last run and the version 
+# string from this, returns:
+#
+# undef if the package should be built
+# the last-version if it shouldn't
+#
+sub check_version_cache{
+	my $version_cache_file = shift;
+	my $version = shift;
+
+	unless(-f $version_cache_file){
+		info("  No cache file at $version_cache_file; building package");
+		return undef;
+	}
+
+	open(my $fh, "<", $version_cache_file) or error("Failed to open version cache file '$version_cache_file' : $!") and next;
+	my $last_version = readline($fh);
+	
+	if( ($version =~ m/^\d+\.\d+$/) and ($last_version =~ m/^\d+\.\d+$/)){
+		return undef if $version > $last_version;
+		return $last_version;
+	}
+
+	error("Can't compare '$last_version' and '$version' as version numbers; building package");
+	return undef;
+
+}
+
+sub write_changes{
+	my $file = shift;
+	my $version = shift;
+
+	open(my $fh, ">", $file) or error ("    Failed to create changes file '$file' : $!") and return();
+	print $fh $version."\n";
+	close($fh);
+	return;
+}
+
+sub get_version{
+	my $command = shift;
+	my @output = run($command);
+	my $version = undef;
+	if($output[0] =~ m/(\d+\.?\d*\.?\d*)/){
+		$version = $1;
+	}
+
+	return $version if $version;
+	error("    Failed to get version");
+	return undef;
+}
+
+sub run{
+	my $cmd = shift;
+	my @output = `$cmd`;
+	my $retval = $? >> 8;
+	if($retval > 0){
+		error("Command '$cmd' exited $retval");
+		error('> '.$_) foreach (@output);
+	}else{
+		debug('> '.$_) foreach (@output);
+	}
+	return @output if $? == 0;
+	return undef;
+}
+
+
+sub debug{
+	return undef unless $ENV{DEBUG};
+	my $message = shift;
+	chomp($message);
+	print STDERR 'DEBUG: '.$message."\n";
+	print $log_fh 'DEBUG: '.$message."\n" if $log_fh;
+}
+
+sub info{
+	my $message = shift;
+	chomp($message);
+	print STDERR 'INFO:  '.$message."\n" unless $quiet;
+	print $log_fh '['.localtime().'] INFO:  '.$message."\n" if $log_fh;
+}
+
+sub error{
+	my $message = shift;
+	chomp($message);
+	print STDERR 'ERROR: '.$message."\n";
+	print $log_fh 'ERROR: '.$message."\n" if $log_fh;
+}
+
+sub abort{
+	my $message = shift;
+	chomp($message);
+	print STDERR 'FATAL: '.$message."\n";
+	print STDERR "Aborting.\n";
+
+	print $log_fh 'FATAL: '.$message."\n" if $log_fh;
+	print $log_fh 'ERROR: '.$message."\n" if $log_fh;
+
+	exit 1;
+}
+
+sub quietly{
+	return unless $quiet;
+	my $message =shift;
+	print $message;
+}
+
+sub usage{
+
+print <<"EOF";
+
+  debit: create simple packages of scripts that can be downloaded via http
+
+Usage:
+
+  debit <options>
+
+Options:
+
+  --config [path] , -c [path]
+
+    specify the path to the config file; default: $f_config
+
+  --package [package-name]
+
+    only build package named 'package-name'
+
+  --skip-version-check
+
+    don't check package version; (re)build all packages anyway
+
+  --logfile [path]
+
+    path to log-file; overrides value in config-file
+
+  --quiet
+
+    only print package names and errors
+
+  --list-packages
+
+    list configured packages and exit; build nothing
+
+  --help
+
+    see this help
+
+  --preserve-temp-dir
+
+    don't delete the temporary working directory; useful for debugging
+
+
+Set the 'DEBUG' environment variable to '1' to get much more output (also 
+sets the --preserve-temp-dir option).
+
+
+EOF
+
+
+
+exit;
+
+}
